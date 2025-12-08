@@ -45,7 +45,7 @@ app.post("/api/checkout", async (req, res) => {
     const preference = await mercadopago.preferences.create({
       items,
       back_urls: {
-        success: "https://materialespayan.online/pago-exito.html",
+        success: "https://materialespayan.online/pago-exitoso.html",
         failure: "https://materialespayan.online/pago-fallo.html",
         pending: "https://materialespayan.online/pago-pendiente.html"
       },
