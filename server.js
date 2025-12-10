@@ -8,12 +8,7 @@ const app = express();
    CONFIG GENERAL
 ============================== */
 
-// Negocio
-const STORE_POSTAL_CODE = "03440";
-const FREE_KM = 5;
-const RATE_PER_KM = 80;
-
-// CORS
+// CORS: permite tu web y pruebas locales
 app.use(cors({
   origin: [
     "https://materialespayan.online",
@@ -36,74 +31,6 @@ mercadopago.configure({
 });
 
 /* ==============================
-   HELPERS ENVÍO
-============================== */
-
-function computeShippingCost(distanceKm) {
-  const km = Number(distanceKm) || 0;
-  if (km <= FREE_KM) return 0;
-
-  const extraKm = km - FREE_KM;
-  const cost = extraKm * RATE_PER_KM;
-
-  return Math.round(cost * 100) / 100;
-}
-
-// Cache simple para no repetir consultas
-const coordsCache = new Map();
-
-// Coordenadas por Código Postal con Nominatim
-async function getCoordsFromPostalCode(postalCode) {
-  const clean = String(postalCode || "").trim();
-  const key = `MX-${clean}`;
-  if (coordsCache.has(key)) return coordsCache.get(key);
-
-  const url =
-    `https://nominatim.openstreetmap.org/search?` +
-    `postalcode=${encodeURIComponent(clean)}` +
-    `&country=Mexico&format=json&limit=1`;
-
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "MaterialesPayanBackend/1.0 (shipping-quote)"
-    }
-  });
-
-  if (!res.ok) throw new Error("No se pudo consultar geocodificación.");
-  const data = await res.json();
-
-  if (!data || !data.length) {
-    throw new Error("No se encontraron coordenadas para ese código postal.");
-  }
-
-  const item = data[0];
-  const coords = { lat: Number(item.lat), lon: Number(item.lon) };
-
-  coordsCache.set(key, coords);
-  return coords;
-}
-
-// Distancia de manejo usando OSRM público
-async function getDrivingDistanceKm(origin, destination) {
-  const url =
-    `https://router.project-osrm.org/route/v1/driving/` +
-    `${origin.lon},${origin.lat};${destination.lon},${destination.lat}` +
-    `?overview=false`;
-
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("No se pudo consultar distancia de ruta.");
-
-  const data = await res.json();
-  const meters = data?.routes?.[0]?.distance;
-
-  if (meters === undefined || meters === null) {
-    throw new Error("No se pudo calcular la distancia de manejo.");
-  }
-
-  return meters / 1000;
-}
-
-/* ==============================
    RUTAS
 ============================== */
 
@@ -112,76 +39,8 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "Materiales Payán Backend",
-    shippingRules: {
-      storePostalCode: STORE_POSTAL_CODE,
-      freeKm: FREE_KM,
-      ratePerKm: RATE_PER_KM
-    }
+    version: "no-shipping"
   });
-});
-
-/* ------------------------------
-   ✅ ENVÍO POR CÓDIGO POSTAL
-
-   Body:
-   {
-     "postalCode": "56618"
-   }
-
-   Response:
-   {
-     "postalCode": "...",
-     "storePostalCode": "03440",
-     "distanceKm": 12.3,
-     "cost": 584,
-     "freeKm": 5,
-     "ratePerKm": 80
-   }
--------------------------------- */
-app.post("/api/shipping-quote", async (req, res) => {
-  try {
-    const { postalCode, zip } = req.body;
-
-    const raw = postalCode || zip;
-    if (!raw) {
-      return res.status(400).json({ error: "Código postal inválido." });
-    }
-
-    const cleanPostal = String(raw).trim();
-
-    // Si es CP de tienda
-    if (cleanPostal === STORE_POSTAL_CODE) {
-      return res.json({
-        postalCode: cleanPostal,
-        storePostalCode: STORE_POSTAL_CODE,
-        distanceKm: 0,
-        cost: 0,
-        freeKm: FREE_KM,
-        ratePerKm: RATE_PER_KM
-      });
-    }
-
-    const originCoords = await getCoordsFromPostalCode(STORE_POSTAL_CODE);
-    const destCoords = await getCoordsFromPostalCode(cleanPostal);
-
-    const distanceKm = await getDrivingDistanceKm(originCoords, destCoords);
-    const cost = computeShippingCost(distanceKm);
-
-    return res.json({
-      postalCode: cleanPostal,
-      storePostalCode: STORE_POSTAL_CODE,
-      distanceKm: Math.round(distanceKm * 100) / 100,
-      cost,
-      freeKm: FREE_KM,
-      ratePerKm: RATE_PER_KM
-    });
-
-  } catch (err) {
-    console.error("Shipping quote error:", err);
-    return res.status(500).json({
-      error: "No se pudo calcular el envío con ese código postal."
-    });
-  }
 });
 
 /* ------------------------------
@@ -190,45 +49,24 @@ app.post("/api/shipping-quote", async (req, res) => {
    Body esperado desde tu front:
    {
      cart: [{ id, name, price, quantity, img }],
-     customer: { name, phone, postalCode },
-     shipping: { distanceKm, cost }
-   }
-
-   (Compatibles también):
-   {
-     shippingCost: number
+     customer: { name, phone } // opcional
    }
 -------------------------------- */
 app.post("/api/checkout", async (req, res) => {
   try {
-    const { cart, customer, shipping, shippingCost } = req.body;
+    const { cart, customer } = req.body;
 
     if (!cart || !Array.isArray(cart) || cart.length === 0) {
       return res.status(400).json({ error: "Carrito vacío" });
     }
 
-    // ✅ soporte doble
-    const finalShippingCost =
-      Number(shipping?.cost) ||
-      Number(shippingCost) ||
-      0;
-
+    // Items para Mercado Pago
     const items = cart.map(p => ({
       title: String(p.name),
       quantity: Number(p.quantity || 1),
       unit_price: Number(p.price),
       currency_id: "MXN"
     }));
-
-    // ✅ Envío como ítem separado
-    if (finalShippingCost > 0) {
-      items.push({
-        title: "Envío a domicilio",
-        quantity: 1,
-        unit_price: finalShippingCost,
-        currency_id: "MXN"
-      });
-    }
 
     const preferenceData = {
       items,
@@ -238,14 +76,11 @@ app.post("/api/checkout", async (req, res) => {
         pending: "https://materialespayan.online/pago-pendiente.html"
       },
       auto_return: "approved",
+      // metadata útil para futuro webhook/WhatsApp
       metadata: {
-        customer: customer || null,
-        shipping: shipping || { cost: finalShippingCost }
+        customer: customer || null
       }
     };
-
-    // Si algún día habilitas webhooks:
-    // process.env.MP_NOTIFICATION_URL && (preferenceData.notification_url = process.env.MP_NOTIFICATION_URL);
 
     const preference = await mercadopago.preferences.create(preferenceData);
 
