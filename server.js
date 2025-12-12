@@ -6,9 +6,10 @@ import crypto from "crypto";
 const app = express();
 
 /* ==============================
-   CORS / CONFIG GENERAL
+   CONFIG GENERAL
 ============================== */
 
+// CORS: permite tu web y pruebas locales
 app.use(cors({
   origin: [
     "https://materialespayan.online",
@@ -34,85 +35,62 @@ mercadopago.configure({
    WHATSAPP CLOUD API
 ============================== */
 
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
-const WHATSAPP_OWNER_PHONE = process.env.WHATSAPP_OWNER_PHONE || "";
+async function sendWhatsAppMessage(to, text) {
+  const token   = process.env.WHATSAPP_TOKEN;
+  const phoneId = process.env.WHATSAPP_PHONE_ID;
 
-// Deja solo dígitos y agrega 52 si no lo tiene
-function normalizeWhatsAppPhone(phone) {
-  if (!phone) return null;
-  let digits = String(phone).replace(/\D/g, "");
-  if (!digits.startsWith("52")) {
-    digits = "52" + digits;
+  if (!token || !phoneId) {
+    throw new Error("Faltan WHATSAPP_TOKEN o WHATSAPP_PHONE_ID en variables de entorno");
   }
-  return digits;
-}
 
-// Enviar mensaje de texto por WhatsApp
-async function sendWhatsAppText(to, body) {
-  try {
-    if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
-      console.error("Faltan WHATSAPP_TOKEN o WHATSAPP_PHONE_ID en las variables de entorno");
-      return;
-    }
+  const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
 
-    const url = `https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_ID}/messages`;
+  const body = {
+    messaging_product: "whatsapp",
+    to,
+    type: "text",
+    text: { body: text }
+  };
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        to,
-        type: "text",
-        text: { body }
-      })
-    });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify(body)
+  });
 
-    const data = await res.json();
+  const data = await res.json();
 
-    if (!res.ok) {
-      console.error("Error al enviar WhatsApp", res.status, data);
-    } else {
-      console.log("WhatsApp enviado correctamente", data);
-    }
-  } catch (err) {
-    console.error("Error inesperado al enviar WhatsApp:", err);
+  if (!res.ok) {
+    console.error("Error WhatsApp API:", data);
+    throw new Error(data?.error?.message || "WhatsApp API error");
   }
+
+  return data;
 }
 
 /* ==============================
    RUTAS BÁSICAS
 ============================== */
 
+// Salud del servicio
 app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "Materiales Payán Backend",
-    version: "whatsapp-step3",
-    whatsapp: {
-      hasToken: Boolean(WHATSAPP_TOKEN),
-      hasPhoneId: Boolean(WHATSAPP_PHONE_ID),
-      hasOwnerPhone: Boolean(WHATSAPP_OWNER_PHONE)
-    }
+    version: "whatsapp-ready-step2",
+    webhookUrl:
+      process.env.MP_NOTIFICATION_URL ||
+      "https://materiales-payan-backend.onrender.com/api/mp/webhook",
+    webhookFromEnv: Boolean(process.env.MP_NOTIFICATION_URL)
   });
 });
 
-/* ==============================
-   CHECKOUT MERCADO PAGO
-============================== */
-/*
-  Body esperado desde el front:
-
-  {
-    cart: [{ id, name, price, quantity, img }],
-    customer: { name, phone }
-  }
-*/
-
+/* ------------------------------
+   ✅ CHECKOUT MERCADO PAGO
+-------------------------------- */
 app.post("/api/checkout", async (req, res) => {
   try {
     const { cart, customer } = req.body;
@@ -144,20 +122,15 @@ app.post("/api/checkout", async (req, res) => {
         pending: "https://materialespayan.online/pago-pendiente.html"
       },
       auto_return: "approved",
-      // Webhook a nuestro backend
-      notification_url: "https://materiales-payan-backend.onrender.com/api/mp/webhook",
-      // Esto viaja a Mercado Pago y regresa en el webhook
+      notification_url:
+        process.env.MP_NOTIFICATION_URL ||
+        "https://materiales-payan-backend.onrender.com/api/mp/webhook",
       metadata: {
         orderId,
         customer,
         cart
       }
     };
-
-    // Si algún día quieres sobreescribir la URL desde env:
-    if (process.env.MP_NOTIFICATION_URL) {
-      preferenceData.notification_url = process.env.MP_NOTIFICATION_URL;
-    }
 
     const preference = await mercadopago.preferences.create(preferenceData);
 
@@ -172,104 +145,38 @@ app.post("/api/checkout", async (req, res) => {
   }
 });
 
-/* ==============================
-   WEBHOOK MERCADO PAGO
-============================== */
-/*
-   Mercado Pago llamará aquí cuando haya cambios en el pago.
-   – Respondemos 200 rápido.
-   – Luego procesamos y mandamos WhatsApp si el pago está "approved".
-*/
-
+/* ------------------------------
+   ✅ WEBHOOK MERCADO PAGO
+-------------------------------- */
 app.post("/api/mp/webhook", async (req, res) => {
-  // Respuesta rápida para que MP no reintente
-  res.sendStatus(200);
+  res.sendStatus(200); // responder rápido
 
   try {
     const topic = req.query.topic || req.query.type;
     const id = req.query.id || req.body?.data?.id;
 
-    if (!id) {
-      console.log("Webhook sin id de pago");
-      return;
-    }
-
-    if (topic !== "payment") {
-      console.log("Webhook ignorado, topic:", topic);
-      return;
-    }
+    if (!id || topic !== "payment") return;
 
     const payment = await mercadopago.payment.findById(id);
 
-    const status = payment?.body?.status;              // approved, pending, rejected...
-    const metadata = payment?.body?.metadata || {};    // lo que mandamos en preference.metadata
+    const status   = payment?.body?.status;
+    const metadata = payment?.body?.metadata;
     const mpPaymentId = payment?.body?.id;
-    const totalAmount = payment?.body?.transaction_amount;
 
     console.log("MP webhook payment:", {
       mpPaymentId,
       status,
-      totalAmount,
-      metadata
+      orderId: metadata?.orderId
     });
 
-    if (status !== "approved") {
-      console.log("Pago no aprobado, no se envía WhatsApp");
-      return;
-    }
+    if (status === "approved") {
+      console.log("✅ PAGO APROBADO - Datos de orden:", {
+        orderId: metadata?.orderId,
+        customer: metadata?.customer,
+        cart: metadata?.cart
+      });
 
-    const customer = metadata.customer || {};
-    const cart = Array.isArray(metadata.cart) ? metadata.cart : [];
-    const orderId = metadata.orderId;
-
-    const customerPhone = normalizeWhatsAppPhone(customer.phone);
-    const ownerPhone = normalizeWhatsAppPhone(WHATSAPP_OWNER_PHONE);
-
-    // Texto con los productos
-    let itemsText = "";
-    if (cart.length) {
-      itemsText = cart.map(p => {
-        const q = p.quantity || 1;
-        const name = p.name || "producto";
-        const price = Number(p.price) || 0;
-        const subtotal = q * price;
-        return `• ${q} x ${name} ($${subtotal} MXN)`;
-      }).join("\n");
-    }
-
-    const totalText = totalAmount
-      ? `Total pagado: $${totalAmount} MXN`
-      : "";
-
-    // ========= Mensaje para el cliente =========
-    if (customerPhone) {
-      await sendWhatsAppText(
-        customerPhone,
-        `Hola ${customer.name || ""}! 🎉\n\n` +
-        `Gracias por tu compra en *Materiales Payán*.\n` +
-        `Hemos recibido tu pago correctamente.\n\n` +
-        `En breve nos pondremos en contacto contigo para coordinar el envío.\n\n` +
-        (totalText ? totalText + "\n\n" : "") +
-        `¡Muchas gracias!`
-      );
-    } else {
-      console.log("No se pudo enviar WhatsApp al cliente: teléfono inválido");
-    }
-
-    // ========= Mensaje para el dueño =========
-    if (ownerPhone) {
-      await sendWhatsAppText(
-        ownerPhone,
-        `✅ *Nuevo pedido pagado en línea*\n\n` +
-        `Cliente: ${customer.name || ""}\n` +
-        `WhatsApp: ${customer.phone || ""}\n` +
-        (orderId ? `ID de orden: ${orderId}\n` : "") +
-        (itemsText ? `\nProductos:\n${itemsText}\n\n` : "") +
-        (totalText ? totalText + "\n\n" : "") +
-        `ID pago MP: ${mpPaymentId || "desconocido"}`
-      );
-    } else {
-      console.log("No se pudo enviar WhatsApp al dueño: WHATSAPP_OWNER_PHONE no configurado");
+      // Aquí más adelante integraremos sendWhatsAppMessage(...)
     }
 
   } catch (err) {
@@ -277,26 +184,56 @@ app.post("/api/mp/webhook", async (req, res) => {
   }
 });
 
-/* ==============================
-   RUTA DE PRUEBA WHATSAPP
-============================== */
+/* ------------------------------
+   ✅ RUTA DE PRUEBA WHATSAPP
+   GET y POST para que sea fácil
+-------------------------------- */
 
+// GET: para probar desde el navegador
 app.get("/api/test-whatsapp", async (req, res) => {
   try {
-    const to = normalizeWhatsAppPhone(WHATSAPP_OWNER_PHONE);
+    const to = process.env.WHATSAPP_OWNER_PHONE;
     if (!to) {
-      return res.status(400).json({ error: "WHATSAPP_OWNER_PHONE no configurado correctamente" });
+      return res.status(500).json({
+        ok: false,
+        error: "Falta WHATSAPP_OWNER_PHONE en las variables de entorno"
+      });
     }
 
-    await sendWhatsAppText(
+    const data = await sendWhatsAppMessage(
       to,
       "Mensaje de prueba desde el backend de Materiales Payán ✅"
     );
 
-    res.json({ ok: true, to });
+    res.json({ ok: true, to, data });
   } catch (err) {
-    console.error("Error en /api/test-whatsapp:", err);
-    res.status(500).json({ error: "No se pudo enviar el WhatsApp de prueba" });
+    console.error("Test WhatsApp error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST: por si luego quieres llamarlo desde tu front
+app.post("/api/test-whatsapp", async (req, res) => {
+  try {
+    const { to, text } = req.body;
+    const phone = to || process.env.WHATSAPP_OWNER_PHONE;
+
+    if (!phone) {
+      return res.status(400).json({
+        ok: false,
+        error: "Debes enviar 'to' o configurar WHATSAPP_OWNER_PHONE"
+      });
+    }
+
+    const data = await sendWhatsAppMessage(
+      phone,
+      text || "Mensaje de prueba desde el backend de Materiales Payán ✅"
+    );
+
+    res.json({ ok: true, to: phone, data });
+  } catch (err) {
+    console.error("Test WhatsApp POST error:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
