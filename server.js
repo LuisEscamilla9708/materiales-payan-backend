@@ -37,6 +37,17 @@ mercadopago.configure({
    WHATSAPP CLOUD API
 ============================== */
 
+function normalizePhone(phone) {
+  if (!phone) return "";
+  // Deja solo dígitos
+  let digits = String(phone).replace(/[^\d]/g, "");
+  // Si tiene 10 dígitos, asumimos México y le agregamos 52
+  if (digits.length === 10) digits = "52" + digits;
+  return digits;
+}
+
+
+
 async function sendWhatsAppMessage(to, text) {
   const token = process.env.WHATSAPP_TOKEN;
   const phoneId = process.env.WHATSAPP_PHONE_ID;
@@ -50,11 +61,11 @@ async function sendWhatsAppMessage(to, text) {
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
 
   const body = {
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body: text },
-  };
+  messaging_product: "whatsapp",
+  to: normalizePhone(to),   // 👈 aquí usamos el helper
+  type: "text",
+  text: { body: text },
+};
 
   const res = await fetch(url, {
     method: "POST",
@@ -157,7 +168,8 @@ app.post("/api/checkout", async (req, res) => {
    ✅ WEBHOOK MERCADO PAGO
 -------------------------------- */
 app.post("/api/mp/webhook", async (req, res) => {
-  res.sendStatus(200); // responder rápido
+  // Respondemos rápido a MP
+  res.sendStatus(200);
 
   try {
     const topic = req.query.topic || req.query.type;
@@ -168,23 +180,77 @@ app.post("/api/mp/webhook", async (req, res) => {
     const payment = await mercadopago.payment.findById(id);
 
     const status = payment?.body?.status;
-    const metadata = payment?.body?.metadata;
+    const metadata = payment?.body?.metadata || {};
     const mpPaymentId = payment?.body?.id;
 
     console.log("MP webhook payment:", {
       mpPaymentId,
       status,
-      orderId: metadata?.orderId,
+      orderId: metadata.orderId,
     });
 
     if (status === "approved") {
+      const customer = metadata.customer || {};
+      const cart = metadata.cart || [];
+
       console.log("✅ PAGO APROBADO - Datos de orden:", {
-        orderId: metadata?.orderId,
-        customer: metadata?.customer,
-        cart: metadata?.cart,
+        orderId: metadata.orderId,
+        customer,
+        cart,
       });
 
-      // Aquí más adelante integraremos sendWhatsAppMessage(...)
+      // Resumen de productos
+      const lines = cart.map((p) => {
+        const qty = Number(p.quantity || 1);
+        const price = Number(p.price || 0);
+        const lineTotal = qty * price;
+        return `- ${p.name} x${qty} = $${lineTotal.toFixed(2)} MXN`;
+      });
+
+      const total = cart.reduce(
+        (acc, p) => acc + Number(p.price || 0) * Number(p.quantity || 1),
+        0
+      );
+
+      // Mensaje para el cliente
+      const msgCustomer =
+        `Hola ${customer.name || ""}! ✅ Tu pago en Materiales Payán fue aprobado.\n\n` +
+        `Pedido ${metadata.orderId || ""}:\n` +
+        `${lines.join("\n")}\n\n` +
+        `Total: $${total.toFixed(2)} MXN\n\n` +
+        `En breve nos pondremos en contacto para coordinar la entrega.`;
+
+      // Mensaje para el dueño
+      const msgOwner =
+        `✅ Nuevo pago aprobado en Materiales Payán.\n\n` +
+        `Orden: ${metadata.orderId || ""}\n` +
+        `Cliente: ${customer.name || ""} (${customer.phone || ""})\n\n` +
+        `${lines.join("\n")}\n\n` +
+        `Total: $${total.toFixed(2)} MXN\n\n` +
+        `ID de pago MP: ${mpPaymentId}`;
+
+      // WhatsApp al cliente
+      try {
+        if (customer.phone) {
+          await sendWhatsAppMessage(customer.phone, msgCustomer);
+        } else {
+          console.warn("No hay phone en metadata.customer");
+        }
+      } catch (err) {
+        console.error("Error enviando WhatsApp al cliente:", err);
+      }
+
+      // WhatsApp al dueño
+      try {
+        const ownerPhone = process.env.WHATSAPP_OWNER_PHONE;
+        if (ownerPhone) {
+          await sendWhatsAppMessage(ownerPhone, msgOwner);
+        } else {
+          console.warn("No hay WHATSAPP_OWNER_PHONE en env");
+        }
+      } catch (err) {
+        console.error("Error enviando WhatsApp al dueño:", err);
+      }
     }
   } catch (err) {
     console.error("Webhook error:", err);
