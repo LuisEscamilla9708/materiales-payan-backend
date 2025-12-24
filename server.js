@@ -9,15 +9,16 @@ const app = express();
    CONFIG GENERAL
 ============================== */
 
-// CORS: permite tu web y pruebas locales
+const allowedOrigins = [
+  "https://materialespayan.online",
+  "https://www.materialespayan.online",
+  "http://localhost:5500",
+  "http://127.0.0.1:5500",
+];
+
 app.use(
   cors({
-    origin: [
-      "https://materialespayan.online",
-      "https://www.materialespayan.online",
-      "http://localhost:5500",
-      "http://127.0.0.1:5500",
-    ],
+    origin: allowedOrigins,
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -32,6 +33,9 @@ app.use(express.json());
 mercadopago.configure({
   access_token: process.env.MP_ACCESS_TOKEN,
 });
+
+// Guarda el último webhook recibido (solo para debug)
+let lastWebhook = null;
 
 /* ==============================
    RUTAS BÁSICAS
@@ -50,9 +54,47 @@ app.get("/", (req, res) => {
   });
 });
 
-// Ruta simple de prueba
+// Ruta de prueba
 app.get("/prueba-ruta", (req, res) => {
   res.send("Ruta de prueba OK desde el backend de Materiales Payán");
+});
+
+/* ------------------------------
+   ✅ PING A MERCADO PAGO (SIN COBRAR)
+   Sirve para confirmar que MP_ACCESS_TOKEN está bien
+-------------------------------- */
+app.get("/api/mp/ping", async (req, res) => {
+  try {
+    const token = process.env.MP_ACCESS_TOKEN;
+    if (!token) {
+      return res.status(500).json({ ok: false, error: "Falta MP_ACCESS_TOKEN" });
+    }
+
+    const r = await fetch("https://api.mercadopago.com/users/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: "Token inválido o sin permisos",
+        details: data,
+      });
+    }
+
+    res.json({
+      ok: true,
+      mpUser: {
+        id: data.id,
+        nickname: data.nickname,
+        site_id: data.site_id,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 /* ------------------------------
@@ -66,7 +108,8 @@ app.post("/api/checkout", async (req, res) => {
       return res.status(400).json({ error: "Carrito vacío" });
     }
 
-    // (Opcional) Si ya no quieres forzar teléfono, puedes dejarlo solo con name
+    // Ya no es obligatorio el teléfono si ya no mandas WhatsApp automático,
+    // pero lo dejamos porque lo usas para tu flujo de "compartir comprobante".
     if (!customer?.name || !customer?.phone) {
       return res.status(400).json({
         error: "Faltan datos del cliente (nombre y WhatsApp).",
@@ -82,6 +125,10 @@ app.post("/api/checkout", async (req, res) => {
 
     const orderId = crypto.randomUUID();
 
+    const notificationUrl =
+      process.env.MP_NOTIFICATION_URL ||
+      "https://materiales-payan-backend.onrender.com/api/mp/webhook";
+
     const preferenceData = {
       items,
       back_urls: {
@@ -89,11 +136,13 @@ app.post("/api/checkout", async (req, res) => {
         failure: "https://materialespayan.online/pago-fallo.html",
         pending: "https://materialespayan.online/pago-pendiente.html",
       },
-      // Para OXXO normalmente caerá en pending
       auto_return: "approved",
-      notification_url:
-        process.env.MP_NOTIFICATION_URL ||
-        "https://materiales-payan-backend.onrender.com/api/mp/webhook",
+      notification_url: notificationUrl,
+
+      // Recomendado: referencia externa simple
+      external_reference: orderId,
+
+      // Te sirve para reconstruir info si luego la ocupas
       metadata: {
         orderId,
         customer,
@@ -106,6 +155,7 @@ app.post("/api/checkout", async (req, res) => {
     return res.json({
       checkoutUrl: preference.body.init_point,
       orderId,
+      notificationUrl,
     });
   } catch (err) {
     console.error("Checkout error:", err);
@@ -115,7 +165,7 @@ app.post("/api/checkout", async (req, res) => {
 
 /* ------------------------------
    ✅ WEBHOOK MERCADO PAGO
-   (Se queda para registro y futuro)
+   (ya no manda WhatsApp, solo registra)
 -------------------------------- */
 app.post("/api/mp/webhook", async (req, res) => {
   // Respondemos rápido a MP
@@ -129,22 +179,28 @@ app.post("/api/mp/webhook", async (req, res) => {
 
     const payment = await mercadopago.payment.findById(id);
 
-    const status = payment?.body?.status; // approved | pending | rejected | etc.
+    const status = payment?.body?.status;
     const metadata = payment?.body?.metadata || {};
     const mpPaymentId = payment?.body?.id;
 
-    console.log("MP webhook payment:", {
+    lastWebhook = {
+      receivedAt: new Date().toISOString(),
       mpPaymentId,
       status,
-      orderId: metadata.orderId,
-      customer: metadata.customer,
-    });
+      orderId: metadata.orderId || payment?.body?.external_reference || null,
+      customer: metadata.customer || null,
+      cartCount: Array.isArray(metadata.cart) ? metadata.cart.length : 0,
+    };
 
-    // Ya NO enviamos WhatsApp aquí.
-    // (En tu front, el cliente presiona el botón y envía el comprobante por WhatsApp)
+    console.log("MP webhook payment:", lastWebhook);
   } catch (err) {
     console.error("Webhook error:", err);
   }
+});
+
+// ✅ DEBUG: ver el último webhook sin entrar a logs
+app.get("/api/debug/last-webhook", (req, res) => {
+  res.json({ ok: true, lastWebhook });
 });
 
 /* ==============================
