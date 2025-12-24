@@ -42,7 +42,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "Materiales Payán Backend",
-    version: "mp-webhook-only-v1", // 👈 actualizado
+    version: "mp-only-v1",
     webhookUrl:
       process.env.MP_NOTIFICATION_URL ||
       "https://materiales-payan-backend.onrender.com/api/mp/webhook",
@@ -50,7 +50,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// ✅ RUTA DE PRUEBA MUY SIMPLE
+// Ruta simple de prueba
 app.get("/prueba-ruta", (req, res) => {
   res.send("Ruta de prueba OK desde el backend de Materiales Payán");
 });
@@ -66,6 +66,7 @@ app.post("/api/checkout", async (req, res) => {
       return res.status(400).json({ error: "Carrito vacío" });
     }
 
+    // (Opcional) Si ya no quieres forzar teléfono, puedes dejarlo solo con name
     if (!customer?.name || !customer?.phone) {
       return res.status(400).json({
         error: "Faltan datos del cliente (nombre y WhatsApp).",
@@ -81,10 +82,6 @@ app.post("/api/checkout", async (req, res) => {
 
     const orderId = crypto.randomUUID();
 
-    const notificationUrl =
-      process.env.MP_NOTIFICATION_URL ||
-      "https://materiales-payan-backend.onrender.com/api/mp/webhook";
-
     const preferenceData = {
       items,
       back_urls: {
@@ -92,13 +89,11 @@ app.post("/api/checkout", async (req, res) => {
         failure: "https://materialespayan.online/pago-fallo.html",
         pending: "https://materialespayan.online/pago-pendiente.html",
       },
+      // Para OXXO normalmente caerá en pending
       auto_return: "approved",
-      notification_url: notificationUrl,
-
-      // ✅ Opcional pero recomendado: ayuda a rastrear pagos por orden
-      external_reference: orderId,
-
-      // Se guarda para tu propia lógica (no es visible al cliente)
+      notification_url:
+        process.env.MP_NOTIFICATION_URL ||
+        "https://materiales-payan-backend.onrender.com/api/mp/webhook",
       metadata: {
         orderId,
         customer,
@@ -120,10 +115,10 @@ app.post("/api/checkout", async (req, res) => {
 
 /* ------------------------------
    ✅ WEBHOOK MERCADO PAGO
-   (solo registra/valida, ya NO manda WhatsApp)
+   (Se queda para registro y futuro)
 -------------------------------- */
 app.post("/api/mp/webhook", async (req, res) => {
-  // Respondemos rápido a Mercado Pago
+  // Respondemos rápido a MP
   res.sendStatus(200);
 
   try {
@@ -134,33 +129,19 @@ app.post("/api/mp/webhook", async (req, res) => {
 
     const payment = await mercadopago.payment.findById(id);
 
-    const status = payment?.body?.status; // approved | pending | rejected | etc
+    const status = payment?.body?.status; // approved | pending | rejected | etc.
     const metadata = payment?.body?.metadata || {};
     const mpPaymentId = payment?.body?.id;
-    const externalReference = payment?.body?.external_reference;
 
     console.log("MP webhook payment:", {
       mpPaymentId,
       status,
-      orderId: metadata.orderId || externalReference,
+      orderId: metadata.orderId,
+      customer: metadata.customer,
     });
 
-    // Si quieres ver más detalle en logs:
-    if (status === "approved") {
-      console.log("✅ PAGO APROBADO (sin WhatsApp automático)", {
-        orderId: metadata.orderId || externalReference,
-        customer: metadata.customer || {},
-        cartCount: Array.isArray(metadata.cart) ? metadata.cart.length : 0,
-      });
-    } else if (status === "pending") {
-      console.log("⏳ PAGO PENDIENTE (ej. OXXO)", {
-        orderId: metadata.orderId || externalReference,
-      });
-    } else {
-      console.log("⚠️ ESTADO DE PAGO:", status, {
-        orderId: metadata.orderId || externalReference,
-      });
-    }
+    // Ya NO enviamos WhatsApp aquí.
+    // (En tu front, el cliente presiona el botón y envía el comprobante por WhatsApp)
   } catch (err) {
     console.error("Webhook error:", err);
   }
